@@ -34,18 +34,43 @@ import rospy
 
 from rosauth.srv import Authentication
 
-from functools import partial
+import sys
+import threading
+import traceback
+from functools import partial, wraps
 
 from tornado.ioloop import IOLoop
-from tornado.websocket import WebSocketHandler
+from tornado.websocket import WebSocketHandler, WebSocketClosedError
+from tornado.gen import coroutine
 
 from rosbridge_library.rosbridge_protocol import RosbridgeProtocol
 from rosbridge_library.util import json, bson
 
+
+def _log_exception():
+    """Log the most recent exception to ROS."""
+    exc = traceback.format_exception(*sys.exc_info())
+    rospy.logerr(''.join(exc))
+
+
+def log_exceptions(f):
+    """Decorator for logging exceptions to ROS."""
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        try:
+            return f(*args, **kwargs)
+        except:
+            _log_exception()
+            raise
+    return wrapper
+
+
 class RosbridgeWebSocket(WebSocketHandler):
     client_id_seed = 0
     clients_connected = 0
+    client_count_pub = None
     authenticate = False
+    use_compression = False
 
     # The following are passed on to RosbridgeProtocol
     # defragmentation.py:
@@ -56,6 +81,7 @@ class RosbridgeWebSocket(WebSocketHandler):
     unregister_timeout = 10.0               # seconds
     bson_only_mode = False
 
+    @log_exceptions
     def open(self):
         cls = self.__class__
         parameters = {
@@ -70,20 +96,28 @@ class RosbridgeWebSocket(WebSocketHandler):
             self.protocol.outgoing = self.send_message
             self.set_nodelay(True)
             self.authenticated = False
+            self._write_lock = threading.RLock()
             cls.client_id_seed += 1
             cls.clients_connected += 1
+            if cls.client_count_pub:
+                cls.client_count_pub.publish(cls.clients_connected)
         except Exception as exc:
             rospy.logerr("Unable to accept incoming connection.  Reason: %s", str(exc))
         rospy.loginfo("Client connected.  %d clients total.", cls.clients_connected)
         if cls.authenticate:
             rospy.loginfo("Awaiting proper authentication...")
 
+    @log_exceptions
     def on_message(self, message):
         cls = self.__class__
         # check if we need to authenticate
         if cls.authenticate and not self.authenticated:
             try:
-                msg = json.loads(message)
+                if cls.bson_only_mode:
+                    msg = bson.BSON(message).decode()
+                else:
+                    msg = json.loads(message)
+
                 if msg['op'] == 'auth':
                     # check the authorization information
                     auth_srv = rospy.ServiceProxy('authenticate', Authentication)
@@ -105,15 +139,51 @@ class RosbridgeWebSocket(WebSocketHandler):
             # no authentication required
             self.protocol.incoming(message)
 
+    @log_exceptions
     def on_close(self):
         cls = self.__class__
         cls.clients_connected -= 1
         self.protocol.finish()
+        if cls.client_count_pub:
+            cls.client_count_pub.publish(cls.clients_connected)
         rospy.loginfo("Client disconnected. %d clients total.", cls.clients_connected)
 
     def send_message(self, message):
-        binary = type(message)==bson.BSON
-        IOLoop.instance().add_callback(partial(self.write_message, message, binary))
+        if type(message) == bson.BSON:
+            binary = True
+        elif type(message) == bytearray:
+            binary = True
+            message = bytes(message)
+        else:
+            binary = False
 
+        with self._write_lock:
+            IOLoop.instance().add_callback(partial(self.prewrite_message, message, binary))
+
+    @coroutine
+    def prewrite_message(self, message, binary):
+        # Use a try block because the log decorator doesn't cooperate with @coroutine.
+        try:
+            with self._write_lock:
+                yield self.write_message(message, binary)
+        except WebSocketClosedError:
+            rospy.logwarn('WebSocketClosedError: Tried to write to a closed websocket')
+            raise
+        except:
+            _log_exception()
+            raise
+
+    @log_exceptions
     def check_origin(self, origin):
         return True
+
+    @log_exceptions
+    def get_compression_options(self):
+        # If this method returns None (the default), compression will be disabled.
+        # If it returns a dict (even an empty one), it will be enabled.
+        cls = self.__class__
+
+        if not cls.use_compression:
+            return None
+
+        return {}
